@@ -25,7 +25,8 @@ const env = parseEnv(
   ),
 );
 
-const database = postgres(env.DATABASE_URL, { prepare: false });
+const postgresClient = postgres(env.DATABASE_URL, { prepare: false });
+const database = drizzle(postgresClient);
 
 const server = new Koa();
 
@@ -42,14 +43,14 @@ server.use(
   }),
 );
 server.use(helloWorld());
-server.use(apiRoutes(database));
+server.use(apiRoutes(database)); 
 
 server.use(
   createKoaMiddleware({
     prefix: "/trpc",
     router: createAppRouter(),
     createContext: async () => ({
-      queryAdapter: await createQueryAdapter(drizzle(database)),
+      queryAdapter: await createQueryAdapter(database), 
     }),
   }),
 );

@@ -1,139 +1,322 @@
 #!/usr/bin/env node
 import "dotenv/config";
-import { z } from "zod";
-import { eq } from "drizzle-orm";
-import { createPublicClient, fallback, webSocket, http, Transport } from "viem";
-import { isDefined } from "@latticexyz/common/utils";
-import { combineLatest, filter, first } from "rxjs";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
-import { cleanDatabase, createStorageAdapter, shouldCleanDatabase } from "@latticexyz/store-sync/postgres";
-import { createStoreSync } from "@latticexyz/store-sync";
-import { indexerEnvSchema, parseEnv } from "./parseEnv";
+import Koa from "koa";
+import cors from "@koa/cors";
+import { createKoaMiddleware } from "trpc-koa-adapter";
+import { createQueryAdapter } from "../postgres/createQueryAdapter";
+import { healthcheck } from "../koa-middleware/healthcheck";
+import { helloWorld } from "../koa-middleware/helloWorld";
+import { apiRoutes } from "../postgres/apiRoutes";
+import { sentry } from "../koa-middleware/sentry";
+import { getFullnodeUrl, SuiClient } from "@mysten/sui/client";
+import {
+  clearPostgresDatabase,
+  setupPostgresDatabase,
+  insertTxPostgres,
+  syncToPostgres,
+} from "../utils/postgres-operations";
+import { dubheStoreEvents, dubheStoreTransactions } from "../postgres/schema";
+import { desc } from "drizzle-orm";
+import { createAppRouter } from "../postgres/createAppRouter";
+import { createServer } from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import yargs from "yargs";
+import { hideBin } from "yargs/helpers";
+import { getSchemaId } from "../utils/read-history";
+import { loadConfig, DubheConfig, parseData } from "@0xobelisk/sui-common";
+import { fetchAllEvents, fetchTransactionBlocks } from "../utils/graphql-query";
+import { OperationType } from "../utils/tables";
 
-const env = parseEnv(
-  z.intersection(
-    indexerEnvSchema,
-    z.object({
-      DATABASE_URL: z.string(),
-      HEALTHCHECK_HOST: z.string().optional(),
-      HEALTHCHECK_PORT: z.coerce.number().optional(),
-    }),
-  ),
-);
+const argv = await yargs(hideBin(process.argv))
+  .option("network", {
+    type: "string",
+    choices: ["mainnet", "testnet", "localnet"],
+    default: "localnet",
+    desc: "Node network (mainnet/testnet/localnet)",
+  })
+  .option("config-path", {
+    type: "string",
+    default: "dubhe.config.ts",
+    desc: "Configuration file path",
+  })
+  .option("force-regenesis", {
+    type: "boolean",
+    default: false,
+    desc: "Force regenesis",
+  })
+  .option("schema-id", {
+    type: "string",
+    description: "Schema ID to filter transactions",
+    // demandOption: true,
+  })
+  .option("host", {
+    type: "string",
+    description: "Host to listen on",
+    default: "0.0.0.0",
+  })
+  .option("port", {
+    type: "number",
+    description: "Port to listen on",
+    default: 3001,
+  })
+  .option("sync-limit", {
+    type: "number",
+    description: "Number of transactions to sync per time",
+    default: 50,
+  })
+  .option("default-page-size", {
+    type: "number",
+    description: "Default page size for pagination",
+    default: 10,
+  })
+  .option("pagination-limit", {
+    type: "number",
+    description: "Maximum pagination limit",
+    default: 100,
+  })
+  .option("sentry-dsn", {
+    type: "string",
+    description: "Sentry DSN for error tracking",
+  })
+  .help("help")
+  .alias("help", "h").argv;
 
-const transports: Transport[] = [
-  // prefer WS when specified
-  env.RPC_WS_URL ? webSocket(env.RPC_WS_URL) : undefined,
-  // otherwise use or fallback to HTTP
-  env.RPC_HTTP_URL ? http(env.RPC_HTTP_URL) : undefined,
-].filter(isDefined);
-
-const publicClient = createPublicClient({
-  transport: fallback(transports),
-  pollingInterval: env.POLLING_INTERVAL,
+const publicClient = new SuiClient({
+  url: getFullnodeUrl(argv.network as any),
 });
 
-const chainId = await publicClient.getChainId();
-const database = drizzle(postgres(env.DATABASE_URL, { prepare: false }));
+const graphqlEndpoint =
+  argv.network === "mainnet"
+    ? "https://sui-mainnet.mystenlabs.com/graphql"
+    : "https://sui-testnet.mystenlabs.com/graphql";
 
-if (await shouldCleanDatabase(database, chainId)) {
-  console.log("outdated database detected, clearing data to start fresh");
-  await cleanDatabase(database);
+console.log("database: ", process.env.DATABASE_URL)
+const database = drizzle(postgres(process.env.DATABASE_URL!));
+if (argv.forceRegenesis) {
+  await clearPostgresDatabase(database);
+}
+await setupPostgresDatabase(database);
+
+async function getLastTxRecord(db: any) {
+  const txRecord = await db
+    .select()
+    .from(dubheStoreTransactions)
+    .orderBy(desc(dubheStoreTransactions.id))
+    .limit(1)
+    .execute();
+  return txRecord.length === 0
+    ? { cursor: undefined, checkpoint: undefined }
+    : { cursor: txRecord[0].cursor, checkpoint: txRecord[0].checkpoint };
 }
 
-const { storageAdapter, tables } = await createStorageAdapter({ database, publicClient });
+const app = new Koa();
+const server = createServer(app.callback());
+const wss = new WebSocketServer({ server });
+const subscriptions = new Map<WebSocket, string[]>();
 
-let startBlock = env.START_BLOCK;
+if (argv.sentryDsn) {
+  app.use(sentry(argv.sentryDsn));
+}
 
-// @ts-ignore
-async function getLatestStoredBlockNumber(): Promise<bigint | undefined> {
-  // Fetch latest block stored in DB. This will throw if the DB doesn't exist yet, so we wrap in a try/catch and ignore the error.
-  // TODO: query if the DB exists instead of try/catch
+app.use(cors());
+app.use(healthcheck({ isReady: () => true }));
+app.use(helloWorld());
+app.use(apiRoutes(database));
+
+app.use(
+  createKoaMiddleware({
+    prefix: "/trpc",
+    router: createAppRouter(),
+    createContext: async () => ({
+      queryAdapter: createQueryAdapter(database),
+    }),
+  })
+);
+
+wss.on("connection", (ws) => {
+  subscriptions.set(ws, []);
+
+  ws.on("message", (message) => {
+    try {
+      const { type, event } = JSON.parse(message.toString());
+      const events = subscriptions.get(ws) || [];
+
+      if (type === "subscribe" && !events.includes(event)) {
+        events.push(event);
+        subscriptions.set(ws, events);
+      } else if (type === "unsubscribe") {
+        subscriptions.set(
+          ws,
+          events.filter((e) => e !== event)
+        );
+      }
+    } catch (error) {
+      console.error("WebSocket message error:", error);
+    }
+  });
+
+  ws.on("close", () => {
+    subscriptions.delete(ws);
+  });
+});
+
+server.listen(argv.port, argv.host, () => {
+  console.log(`postgres indexer frontend exposed on port ${argv.port}
+  - HTTP:   http://${argv.host}:${argv.port}
+  - WS:     ws://${argv.host}:${argv.port}
+  - GraphQL:   http://${argv.host}:${argv.port}/graphql`);
+});
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let schemaId = argv.schemaId;
+if (!schemaId) {
   try {
-    const chainState = await database
-      .select()
-      .from(tables.configTable)
-      .where(eq(tables.configTable.chainId, chainId))
-      .limit(1)
-      .execute()
-      // Get the first record in a way that returns a possible `undefined`
-      // TODO: move this to `.findFirst` after upgrading drizzle or `rows[0]` after enabling `noUncheckedIndexedAccess: true`
-      .then((rows) => rows.find(() => true));
-
-    return chainState?.blockNumber;
+    const config: DubheConfig = (await loadConfig(
+      argv.configPath
+    )) as DubheConfig;
+    schemaId = await getSchemaId(config.name, argv.network);
   } catch (error) {
-    // ignore errors for now
+    console.error("Error loading config:", error);
+    process.exit(1);
   }
 }
 
-async function getDistanceFromFollowBlock(): Promise<bigint> {
-  const [latestStoredBlockNumber, latestFollowBlock] = await Promise.all([
-    getLatestStoredBlockNumber(),
-    publicClient.getBlock({ blockTag: env.FOLLOW_BLOCK_TAG }),
-  ]);
-  return latestFollowBlock.number - (latestStoredBlockNumber ?? -1n);
-}
+while (true) {
+  await delay(2000);
+  const lastTxRecord = await getLastTxRecord(database);
+  let txs;
 
-const latestStoredBlockNumber = await getLatestStoredBlockNumber();
-if (latestStoredBlockNumber != null) {
-  startBlock = latestStoredBlockNumber + 1n;
-  console.log("resuming from block number", startBlock);
-}
+  if (argv.network === "mainnet" || argv.network === "testnet") {
+    try {
+      const graphqlResponse = await fetchTransactionBlocks({
+        graphqlEndpoint,
+        changedObject: schemaId,
+        first: argv.syncLimit,
+        afterCheckpoint: lastTxRecord.checkpoint
+          ? parseInt(lastTxRecord.checkpoint)
+          : undefined,
+      });
 
-const { latestBlockNumber$, storedBlockLogs$ } = await createStoreSync({
-  storageAdapter,
-  publicClient,
-  followBlockTag: env.FOLLOW_BLOCK_TAG,
-  startBlock,
-  maxBlockRange: env.MAX_BLOCK_RANGE,
-  address: env.STORE_ADDRESS,
-});
+      txs = await Promise.all(
+        graphqlResponse.transactionBlocks.edges.map(async (edge) => {
+          const allEvents = await fetchAllEvents({
+            graphqlEndpoint,
+            transactionDigest: edge.node.digest,
+          });
+          return {
+            cursor: edge.cursor,
+            digest: edge.node.digest,
+            checkpoint: edge.node.effects.checkpoint.sequenceNumber.toString(),
+            timestampMs: new Date(edge.node.effects.timestamp)
+              .getTime()
+              .toString(),
+            events: allEvents.map((event) => ({
+              parsedJson: event.contents.json,
+            })),
+          };
+        })
+      );
+    } catch (error) {
+      console.error("Error fetching GraphQL data:", error);
+      await delay(5000);
+      continue;
+    }
+  } else {
+    const response = await publicClient.queryTransactionBlocks({
+      filter: { ChangedObject: schemaId },
+      order: "ascending",
+      cursor: lastTxRecord.cursor,
+      limit: argv.syncLimit,
+      options: { showEvents: true },
+    });
 
-storedBlockLogs$.subscribe();
+    txs = response.data.map((tx) => ({
+      ...tx,
+      cursor: tx.digest,
+    }));
+  }
 
-let isCaughtUp = false;
-combineLatest([latestBlockNumber$, storedBlockLogs$])
-  .pipe(
-    filter(
-      ([latestBlockNumber, { blockNumber: lastBlockNumberProcessed }]) =>
-        latestBlockNumber === lastBlockNumberProcessed,
-    ),
-    first(),
-  )
-  .subscribe(() => {
-    isCaughtUp = true;
-    console.log("all caught up");
-  });
+  for (const tx of txs) {
+    await insertTxPostgres(
+      database,
+      tx.checkpoint?.toString() as string,
+      tx.digest,
+      tx.cursor,
+      tx.timestampMs?.toString() as string
+    );
 
-if (env.HEALTHCHECK_HOST != null || env.HEALTHCHECK_PORT != null) {
-  const { default: Koa } = await import("koa");
-  const { default: cors } = await import("@koa/cors");
-  const { healthcheck } = await import("../koa-middleware/healthcheck");
-  const { metrics } = await import("../koa-middleware/metrics");
-  const { helloWorld } = await import("../koa-middleware/helloWorld");
+    if (tx.events) {
+      for (const event of tx.events) {
+        console.log("EventData: ", JSON.stringify(event.parsedJson, null, 2));
 
-  const server = new Koa();
+        // @ts-ignore
+        const name: string = event.parsedJson["name"];
+        if (name.endsWith("_event")) {
+          await database.insert(dubheStoreEvents).values(
+            parseData({
+              checkpoint: tx.checkpoint?.toString() as string,
+              digest: tx.digest,
+              created_at: tx.timestampMs?.toString() as string,
+              name: name,
+              // @ts-ignore
+              value: event.parsedJson["value"],
+            })
+          );
 
-  server.use(cors());
-  server.use(
-    healthcheck({
-      isReady: () => isCaughtUp,
-    }),
-  );
-  server.use(
-    metrics({
-      isHealthy: () => true,
-      isReady: () => isCaughtUp,
-      getLatestStoredBlockNumber,
-      getDistanceFromFollowBlock,
-      followBlockTag: env.FOLLOW_BLOCK_TAG,
-    }),
-  );
-  server.use(helloWorld());
+          wss.clients.forEach((client) => {
+            if (
+              client.readyState === client.OPEN &&
+              subscriptions.get(client)?.includes(name)
+            ) {
+              client.send(
+                JSON.stringify(
+                  parseData({
+                    name: name,
+                    // @ts-ignore
+                    value: event.parsedJson["value"],
+                  })
+                )
+              );
+            }
+          });
 
-  server.listen({ host: env.HEALTHCHECK_HOST, port: env.HEALTHCHECK_PORT });
-  console.log(
-    `postgres indexer healthcheck server listening on http://${env.HEALTHCHECK_HOST}:${env.HEALTHCHECK_PORT}`,
-  );
+          await syncToPostgres(
+            database,
+            tx.checkpoint?.toString() as string,
+            tx.digest,
+            tx.timestampMs?.toString() as string,
+            event.parsedJson,
+            OperationType.Set
+          );
+        } else {
+          await syncToPostgres(
+            database,
+            tx.checkpoint?.toString() as string,
+            tx.digest,
+            tx.timestampMs?.toString() as string,
+            event.parsedJson,
+            OperationType.Remove
+          );
+
+          wss.clients.forEach((client) => {
+            if (
+              client.readyState === client.OPEN &&
+              subscriptions.get(client)?.includes(name)
+            ) {
+              client.send(
+                JSON.stringify({
+                  // @ts-ignore
+                  ...event.parsedJson,
+                  value: null,
+                })
+              );
+            }
+          });
+        }
+      }
+    }
+  }
 }
