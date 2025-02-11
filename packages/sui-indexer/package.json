@@ -38,20 +38,22 @@
 		"clean:js": "shx rm -rf dist",
 		"dev": "tsup --watch",
 		"lint": "eslint .",
-		"start:postgres": "concurrently -n indexer,frontend -c cyan,magenta 'tsx bin/postgres-indexer' 'tsx bin/postgres-frontend'",
-		"start:postgres-decoded": "tsx bin/postgres-decoded-indexer",
-		"start:postgres-decoded:local": "DATABASE_URL=postgres://127.0.0.1/postgres RPC_HTTP_URL=http://127.0.0.1:8545 pnpm start:postgres-decoded",
-		"start:postgres-decoded:testnet": "DATABASE_URL=postgres://127.0.0.1/postgres RPC_HTTP_URL=https://rpc.holesky.redstone.xyz pnpm start:postgres-decoded",
-		"start:postgres:local": "DATABASE_URL=postgres://127.0.0.1/postgres RPC_HTTP_URL=http://127.0.0.1:8545 pnpm start:postgres",
-		"start:postgres:testnet": "DATABASE_URL=postgres://127.0.0.1/postgres RPC_HTTP_URL=https://rpc.holesky.redstone.xyz pnpm start:postgres",
+		"start:postgres": "tsx bin/postgres-indexer",
 		"start:sqlite": "tsx bin/sqlite-indexer",
-		"start:sqlite:local": "SQLITE_FILENAME=anvil.db RPC_HTTP_URL=http://127.0.0.1:8545 pnpm start:sqlite",
-		"start:sqlite:testnet": "SQLITE_FILENAME=testnet.db RPC_HTTP_URL=https://rpc.holesky.redstone.xyz pnpm start:sqlite",
+		"start:postgres:mainnet": "NETWORK=mainnet DATABASE_URL=postgresql://dubhe:dubhe123@localhost:5432/dubhe_indexer pnpm start:postgres",
+		"start:postgres:testnet": "NETWORK=testnet DATABASE_URL=postgresql://dubhe:dubhe123@localhost:5432/dubhe_indexer pnpm start:postgres",
+		"start:postgres:devnet": "NETWORK=devnet DATABASE_URL=postgresql://dubhe:dubhe123@localhost:5432/dubhe_indexer pnpm start:postgres",
+		"start:postgres:localnet": "NETWORK=localnet DATABASE_URL=postgresql://dubhe:dubhe123@localhost:5432/dubhe_indexer pnpm start:postgres",
+		"start:sqlite:mainnet": "NETWORK=mainnet SQLITE_FILENAME=mainnet.db pnpm start:sqlite",
+		"start:sqlite:testnet": "NETWORK=testnet SQLITE_FILENAME=testnet.db pnpm start:sqlite",
+		"start:sqlite:devnet": "NETWORK=devnet SQLITE_FILENAME=devnet.db pnpm start:sqlite",
+		"start:sqlite:localnet": "NETWORK=localnet SQLITE_FILENAME=localnet.db pnpm start:sqlite",
 		"test": "tsc --noEmit",
 		"test:ci": "pnpm run test"
 	},
 	"dependencies": {
 		"@0xobelisk/sui-common": "workspace:*",
+		"@0xobelisk/sui-indexer": "^1.1.3",
 		"@graphql-tools/schema": "^10.0.16",
 		"@koa/cors": "^4.0.0",
 		"@koa/router": "^12.0.1",
@@ -82,6 +84,7 @@
 		"superjson": "^1.12.4",
 		"trpc-koa-adapter": "^1.1.3",
 		"tsup": "^8.3.5",
+		"viem": "^2.22.23",
 		"ws": "^8.18.0",
 		"yargs": "^17.7.1",
 		"zod": "3.23.8"
@@ -100,12 +103,8 @@
 		"concurrently": "^8.2.2",
 		"graphql-ws": "^6.0.2",
 		"jest": "^29.7.0",
-		"viem": "2.21.19",
 		"vitest": "0.34.6",
 		"ws": "^8.18.0"
-	},
-	"peerDependencies": {
-		"viem": "2.x"
 	},
 	"publishConfig": {
 		"access": "public"
